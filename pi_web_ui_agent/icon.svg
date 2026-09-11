@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <radialGradient id="head" cx="50%" cy="40%" r="50%">
+      <stop offset="0%" stop-color="#7cff7c"/>
+      <stop offset="100%" stop-color="#2ea82e"/>
+    </radialGradient>
+  </defs>
+  <!-- antennae -->
+  <line x1="44" y1="24" x2="32" y2="4" stroke="#2ea82e" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="32" cy="4" r="4" fill="#7cff7c"/>
+  <line x1="84" y1="24" x2="96" y2="4" stroke="#2ea82e" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="96" cy="4" r="4" fill="#7cff7c"/>
+  <!-- head -->
+  <ellipse cx="64" cy="58" rx="40" ry="38" fill="url(#head)"/>
+  <!-- eyes -->
+  <ellipse cx="46" cy="50" rx="10" ry="12" fill="#111"/>
+  <ellipse cx="82" cy="50" rx="10" ry="12" fill="#111"/>
+  <!-- eye highlights -->
+  <circle cx="50" cy="46" r="3" fill="#fff"/>
+  <circle cx="86" cy="46" r="3" fill="#fff"/>
+  <!-- mouth -->
+  <path d="M44 72 Q64 82 84 72" fill="none" stroke="#111" stroke-width="2" stroke-linecap="round"/>
+</svg>

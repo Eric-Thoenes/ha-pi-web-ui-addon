@@ -1,26 +1,36 @@
-# Pi Web UI — Home Assistant Add-on Repository
+# 👾 Pi UI — Home Assistant Add-on
 
-Add-on Home Assistant che espone **pi-web-ui** (interfaccia web del coding
-agent Pi) come istanza indipendente, accessibile via **ingress** di Home
-Assistant.
+Web UI del coding agent [Pi](https://pi.dev), accessibile via ingress in Home Assistant.
+
+## Come funziona
+
+Questo add-on avvia due processi all'interno del container:
+
+1. **pi-web-ui** (porta `8888`) — server web con interfaccia chat per Pi
+2. **Proxy ingress** (porta `3000`) — inoltra il traffico da HA ingress a pi-web-ui, gestendo prefisso percorso e WebSocket
+
+Sessioni, skills e workspace persistono in `/data` (dentro il container).
 
 ## Installazione
 
-1. In Home Assistant: **Impostazioni → Applicazioni → ⋮ → Archivi digitali**
-   (oppure "Aggiungi repository")
-2. Incolla l'URL di questo repository GitHub e conferma
-3. Aggiorna: **⋮ → Controlla gli aggiornamenti**
-4. Nel negozio compare **"Pi Web UI — istanza autonoma"** → **Installa**
+1. Aggiungi questo repository a Home Assistant:
+   **Impostazioni → Componenti aggiuntivi → ⋮ → Repository**
+   URL: `https://github.com/Eric-Thoenes/ha-pi-web-ui-addon`
 
-## Contenuto
+2. **Controlla aggiornamenti** (⋮ → Controlla aggiornamenti)
 
-- `repository.json` — manifest del repository add-on
-- `pi_web_ui_agent/` — l'add-on (config.yaml, Dockerfile, run.sh, proxy.mjs)
+3. Clicca **"Pi UI"** → **Installa**
 
-## Note tecniche
+4. **Avvia** e apri dalla sidebar
 
-- Base image: `node:22-slim`
-- Installa `pi-web-ui@0.76.0` (include `@earendil-works/pi-coding-agent`)
-- Il server pi-web-ui gira su `:8888`, un piccolo proxy Node lo espone su
-  `:3000` gestendo `X-Ingress-Path` (riscrittura path asset + tunnel WebSocket)
-- Dati persistenti in `/data/pi-web-data` e `/data/pi-web-agent`
+## Persistenza
+
+Tutti i dati (sessioni, workspace, skills) sono in `/data/pi-web-data` e `/data/pi-web-agent` dentro il container. I dati sopravvivono a riavvii e aggiornamenti dell'add-on.
+
+## Configurazione
+
+| Opzione | Default | Descrizione |
+|---|---|---|
+| `PI_ADDON_CWD` | `/data/workspace` | Directory di lavoro pi-web-ui |
+| `PI_ADDON_DATA` | `/data/pi-web-data` | Dati persistenti sessioni |
+| `PI_ADDON_AGENT` | `/data/pi-web-agent` | Skills e configurazioni |
