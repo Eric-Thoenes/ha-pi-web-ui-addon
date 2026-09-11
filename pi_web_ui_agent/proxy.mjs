@@ -34,51 +34,32 @@ function rewriteHtml(bodyStr) {
     .replace(/(src|href)='\/(assets\/|favicon\.svg)/g, (m, attr, p1) => `${attr}='./${p1}`);
 }
 
-// ── Service worker modificato ─────────────────────────────────────
-let _patchedSw = null;
-
-function getPatchedSw(cb) {
-  if (_patchedSw) { cb(_patchedSw); return; }
-  http.get({ hostname: PI_WEB_UI_HOST, port: PI_WEB_UI_PORT, path: "/sw.js" }, (res) => {
-    let data = "";
-    res.on("data", (c) => { data += c; });
-    res.on("end", () => {
-      // Inserisce un bypass WebSocket all'inizio del fetch handler.
-      // Chrome/Edge abbattono le connessioni WS quando lo SW intercetta
-      // ma non chiama respondWith(). Con respondWith(fetch(...)) il WS
-      // viene correttamente inoltrato alla rete.
-      _patchedSw = data.replace(
-        'self.addEventListener("fetch", (event) => {',
-        `self.addEventListener("fetch", (event) => {
-  // Chrome/Edge abbattono le WS se lo SW intercetta senza respondWith
-  if (event.request.headers && event.request.headers.get("Upgrade") === "websocket") {
-    event.respondWith(fetch(event.request));
-    return;
-  }`);
-      cb(_patchedSw);
-    });
-  }).on("error", (err) => {
-    console.error(`[proxy] SW fetch failed: ${err.message}`);
-    cb(null);
-  });
-}
+// ── Service worker minimale ─────────────────────────────────────
+// Chrome/Edge abbattono le connessioni WS quando lo SW ha un fetch handler
+// che intercetta la richiesta ma non chiama respondWith(). Il SW originale
+// di pi-web-ui fa questo per tutte le richieste non cacheabili (WS / API).
+// Qui serviamo uno SW minimale SENZA fetch handler, così la WS passa
+// inalterata. I notification click non funzioneranno, ma l'app sì.
+const MINIMAL_SW = `
+// pi-web-ui SW stub — nessun fetch handler (Chrome WS compat)
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
+`.trim();
 
 // ── Server HTTP ──────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   const base = getIngressBase(req);
   const path = targetPath(req.url, base);
 
-  // /sw.js → serve patch modificato (non la versione originale di pi-web-ui)
+  // /sw.js → serve service worker MINIMALE (nessun fetch handler)
+  // per evitare che Chrome/Edge abbattono le WS.
   if (path === "/sw.js") {
-    getPatchedSw((swContent) => {
-      if (!swContent) { res.writeHead(502); res.end(); return; }
-      res.writeHead(200, {
-        "Content-Type": "application/javascript; charset=UTF-8",
-        "Content-Length": Buffer.byteLength(swContent),
-        "Cache-Control": "no-cache",
-      });
-      res.end(swContent);
+    res.writeHead(200, {
+      "Content-Type": "application/javascript; charset=UTF-8",
+      "Content-Length": Buffer.byteLength(MINIMAL_SW),
+      "Cache-Control": "no-cache",
     });
+    res.end(MINIMAL_SW);
     return;
   }
 
