@@ -48,6 +48,7 @@ function rewriteHtml(bodyStr) {
 const server = http.createServer((req, res) => {
   const base = getIngressBase(req);
   const path = targetPath(req.url, base);
+  console.log(`[proxy] ${req.method} ${req.url} host="${req.headers.host || ""}" x-ingress="${req.headers["x-ingress-path"] || ""}" origin="${req.headers.origin || ""}"`);
   const opts = {
     hostname: PI_WEB_UI_HOST,
     port: PI_WEB_UI_PORT,
@@ -113,6 +114,7 @@ const server = http.createServer((req, res) => {
 server.on("upgrade", (request, socket) => {
   const base = getIngressBase(request);
   const path = targetPath(request.url, base);
+  console.log(`[proxy] WS upgrade url="${request.url}" host="${request.headers.host || ""}" origin="${request.headers.origin || ""}" x-ingress="${request.headers["x-ingress-path"] || ""}"`);
   try {
     const up = net.connect({ hostname: PI_WEB_UI_HOST, port: PI_WEB_UI_PORT });
     up.on("ready", () => {
@@ -124,7 +126,11 @@ server.on("upgrade", (request, socket) => {
         "Upgrade: websocket",
         "Connection: Upgrade",
         ...(
-          ["Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol", "Sec-WebSocket-Extensions", "Origin", "User-Agent", "Cookie"]
+          // NON inoltrare "Origin": pi-web-ui ammette i client senza Origin
+          // (regola "non-browser client"). L'Origin del browser dietro ingress
+          // a sessione non coincide con l'Host che il Supervisor usa lato WS,
+          // quindi inoltrandolo pi-web-ui risponderebbe 403.
+          ["Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol", "Sec-WebSocket-Extensions", "User-Agent", "Cookie"]
             .filter((k) => request.headers[k.toLowerCase()])
             .map((k) => `${k}: ${request.headers[k.toLowerCase()]}`)
         ),
