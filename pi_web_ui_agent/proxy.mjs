@@ -1,15 +1,21 @@
 /**
  * Pi Web Addon proxy — HTTP e WebSocket forward per ingress Home Assistant.
  * Ascolta su :3000 (ingress_port dell'add-on), inoltra a pi-web-ui su 127.0.0.1:8888.
- * Strippa il prefisso ingress (X-Ingress-Path) dal path in ingresso e riscrive
- * SOLO i riferimenti asset assoluti (src/href) nell'HTML con quel prefisso.
  *
- * IMPORTANTE (pi-web-ui v0.76.0): il frontend calcola già il base path a runtime
- * da `document.baseURI` (funzioni Kl()/cr()/at() nel bundle) e lo applica a /ws,
- * /api/* e alla registrazione del service worker. Riscrivere "/api/" e "/ws" nei
- * body JS causerebbe un DOPPIO prefisso (es. .../pi_web_ui_agent/pi_web_ui_agent/api/...)
- * e romperebbe API e WebSocket. Qui si riscrivono quindi solo i path asset assoluti
- * dell'index.html (/assets/, /favicon.svg, ecc.), che il frontend NON riscrive da solo.
+ * Come funziona l'ingress nelle versioni recenti di HA Supervisor:
+ *   - L'add-on viene aperto via iframe su /api/hassio_ingress/{token}/.
+ *   - Il Supervisor spoglia già il prefisso /api/hassio_ingress/{token} e
+ *     inoltra la richiesta alla RADICE dell'add-on (es. GET /, /assets/..., /ws).
+ *   - NON viene inviato alcun header X-Ingress-Path: l'add-on non può conoscere
+ *     il prefisso. (Legacy X-Ingress-Path è comunque gestito per compatibilità.)
+ *
+ * Conseguenza importante (pi-web-ui v0.76.0):
+ *   - Il frontend calcola il base path a runtime da document.baseURI e lo applica
+ *     da solo a /ws, /api/* e alla registrazione del service worker. NON va quindi
+ *     riscritto nulla in questi URL.
+ *   - L'index.html usa però path asset ASSOLUTI (/assets/..., /favicon.svg): dietro
+ *     ingress il browser li risolverebbe sulla radice dell'host (sbagliato).
+ *     Li rendiamo RELATIVI (./assets/...), così funzionano con qualunque prefisso.
  */
 
 import http from "node:http";
@@ -24,20 +30,19 @@ function getIngressBase(req) {
   return p || "";
 }
 
-/** Strippa il prefisso ingress dal path; ritorna path relativo a pi-web-ui */
+/** Strippa il prefisso ingress (solo se presente) dal path in ingresso. */
 function targetPath(url, base) {
   let p = url || "/";
   if (base && p.startsWith(base)) p = p.slice(base.length);
   return p === "" ? "/" : p;
 }
 
-/** Riscrive i path asset assoluti dell'HTML aggiungendo il prefisso ingress */
-function rewriteHtml(bodyStr, ingressBase) {
-  if (!ingressBase) return bodyStr;
-  const base = ingressBase.replace(/^\//, ""); // senza slash iniziale
+/** Rende relativi i path asset assoluti dell'HTML, così funzionano dietro
+ *  qualunque prefisso ingress (anche a sessione, dove il prefisso non è noto). */
+function rewriteHtml(bodyStr) {
   return bodyStr
-    .replace(/="\/(assets\/|favicon\.svg|manifest\.webmanifest|icons\/)/g, (m, p1) => `="/${base}/${p1}`)
-    .replace(/='\/(assets\/|favicon\.svg)/g, (m, p1) => `='/${base}/${p1}`);
+    .replace(/(src|href)="\/(assets\/|favicon\.svg|manifest\.webmanifest|icons\/)/g, (m, attr, p1) => `${attr}="./${p1}`)
+    .replace(/(src|href)='\/(assets\/|favicon\.svg)/g, (m, attr, p1) => `${attr}='./${p1}`);
 }
 
 const server = http.createServer((req, res) => {
@@ -67,22 +72,22 @@ const server = http.createServer((req, res) => {
     const ctype = (proxyRes.headers["content-type"] || "");
     const isHtml = /^text\/html/i.test(ctype) && proxyRes.statusCode !== 204;
 
-    // Tutto ciò che non è HTML (JS, CSS, JSON, immagini, WS-adjacent) passa
-    // invariato: content-length e content-encoding restano validi.
-    if (!isHtml || !base) {
+    // Tutto ciò che non è HTML (JS, CSS, JSON, immagini, WS) passa invariato:
+    // content-length e content-encoding restano validi.
+    if (!isHtml) {
       res.writeHead(proxyRes.statusCode, proxyRes.headers);
       proxyRes.pipe(res);
       return;
     }
 
-    // Solo HTML con prefisso ingress: buffera, riscrivi gli asset, ricalcola
-    // content-length (e togli gli header non più validi dopo la riscrittura).
+    // Solo HTML: buffera, rendi relativi gli asset, ricalcola content-length
+    // (e togli gli header non più validi dopo la riscrittura).
     const chunks = [];
     let total = 0;
     proxyRes.on("data", (c) => { chunks.push(c); total += c.length; });
     proxyRes.on("end", () => {
       const body = Buffer.concat(chunks, total).toString("utf8");
-      const rewritten = rewriteHtml(body, base);
+      const rewritten = rewriteHtml(body);
       const headers = { ...proxyRes.headers };
       delete headers["content-length"];
       delete headers["content-encoding"];
