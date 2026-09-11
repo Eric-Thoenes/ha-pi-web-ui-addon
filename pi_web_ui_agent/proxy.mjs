@@ -50,7 +50,10 @@ const server = http.createServer((req, res) => {
     method: req.method,
     headers: {
       ...req.headers,
-      host: `${PI_WEB_UI_HOST}:${PI_WEB_UI_PORT}`,
+      // IMPORTANTE: NON sovrascrivere `host` con 127.0.0.1:8888. pi-web-ui
+      // valida l'ammissione WebSocket confrontando l'Origin del browser con
+      // l'header Host ricevuto; sovrascrivendolo i due non coinciderebbero e
+      // il server rifiuterebbe l'upgrade con 403 (schermata nera).
       // Chiediamo sempre identity: se l'upstream comprime (gzip) non potremmo
       // riscrivere il body testuale in modo sicuro. Su LAN il costo è trascurabile.
       "accept-encoding": "identity",
@@ -110,7 +113,9 @@ server.on("upgrade", (request, socket) => {
     up.on("ready", () => {
       const hdrs = [
         `GET ${path} HTTP/1.1`,
-        `Host: ${PI_WEB_UI_HOST}:${PI_WEB_UI_PORT}`,
+        // Preserva l'Host originale del browser: pi-web-ui lo confronta con
+        // l'Origin per ammettere l'upgrade WebSocket (stessa autorità).
+        `Host: ${request.headers.host || `${PI_WEB_UI_HOST}:${PI_WEB_UI_PORT}`}`,
         "Upgrade: websocket",
         "Connection: Upgrade",
         ...(

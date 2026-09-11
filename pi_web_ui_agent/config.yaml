@@ -1,5 +1,5 @@
 name: Pi UI
-version: 0.76.2
+version: 0.76.3
 slug: pi_web_ui_agent
 description: >-
   Web UI del coding agent Pi, istanza indipendente con ingress HA.
