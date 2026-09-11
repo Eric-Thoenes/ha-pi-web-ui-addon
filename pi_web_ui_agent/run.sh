@@ -16,12 +16,14 @@ PI_WEB_PORT=8888 PI_WEB_HOST=127.0.0.1 \
   --cwd "$CWD" --data-dir "$DATA_DIR" --agent-dir "$AGENT_DIR" \
   > /data/pi-web.log 2>&1 &
 SERVER_PID=$!
-echo "pi-web-ui PID=$SERVER_PID"
+echo "pi-web-ui PID=$SERVER_PID (log tail attivo)"
+tail -f /data/pi-web.log &
 
 # 2. proxy ingress: :3000 -> 127.0.0.1:8888 (gestisce X-Ingress-Path e WS)
 LISTEN_PORT=3000 node /proxy.mjs > /data/pi-web-proxy.log 2>&1 &
 PROXY_PID=$!
-echo "proxy PID=$PROXY_PID"
+echo "proxy PID=$PROXY_PID (log tail attivo)"
+tail -f /data/pi-web-proxy.log &
 
 trap 'kill $PROXY_PID $SERVER_PID 2>/dev/null; exit' TERM INT
 wait $SERVER_PID
