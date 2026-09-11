@@ -1,21 +1,13 @@
 /**
  * Pi Web Addon proxy — HTTP e WebSocket forward per ingress Home Assistant.
- * Ascolta su :3000 (ingress_port dell'add-on), inoltra a pi-web-ui su 127.0.0.1:8888.
  *
- * Come funziona l'ingress nelle versioni recenti di HA Supervisor:
- *   - L'add-on viene aperto via iframe su /api/hassio_ingress/{token}/.
- *   - Il Supervisor spoglia già il prefisso /api/hassio_ingress/{token} e
- *     inoltra la richiesta alla RADICE dell'add-on (es. GET /, /assets/..., /ws).
- *   - NON viene inviato alcun header X-Ingress-Path: l'add-on non può conoscere
- *     il prefisso. (Legacy X-Ingress-Path è comunque gestito per compatibilità.)
+ * Ingress moderno (a sessione): /api/hassio_ingress/{token}/ → Supervisor
+ * spoglia il prefisso e inoltra alla radice dell'add-on (no X-Ingress-Path).
  *
- * Conseguenza importante (pi-web-ui v0.76.0):
- *   - Il frontend calcola il base path a runtime da document.baseURI e lo applica
- *     da solo a /ws, /api/* e alla registrazione del service worker. NON va quindi
- *     riscritto nulla in questi URL.
- *   - L'index.html usa però path asset ASSOLUTI (/assets/..., /favicon.svg): dietro
- *     ingress il browser li risolverebbe sulla radice dell'host (sbagliato).
- *     Li rendiamo RELATIVI (./assets/...), così funzionano con qualunque prefisso.
+ * Pi Web UI v0.76.0: il frontend calcola il base path da document.baseURI.
+ * Solo gli asset statici nell'HTML vanno resi relativi (./assets/...).
+ * Il service worker deve forwardare il WebSocket con respondWith() altrimenti
+ * Chrome/Edge abbattono la connessione WS (bug noto SW/#2104).
  */
 
 import http from "node:http";
@@ -30,25 +22,67 @@ function getIngressBase(req) {
   return p || "";
 }
 
-/** Strippa il prefisso ingress (solo se presente) dal path in ingresso. */
 function targetPath(url, base) {
   let p = url || "/";
   if (base && p.startsWith(base)) p = p.slice(base.length);
   return p === "" ? "/" : p;
 }
 
-/** Rende relativi i path asset assoluti dell'HTML, così funzionano dietro
- *  qualunque prefisso ingress (anche a sessione, dove il prefisso non è noto). */
 function rewriteHtml(bodyStr) {
   return bodyStr
     .replace(/(src|href)="\/(assets\/|favicon\.svg|manifest\.webmanifest|icons\/)/g, (m, attr, p1) => `${attr}="./${p1}`)
     .replace(/(src|href)='\/(assets\/|favicon\.svg)/g, (m, attr, p1) => `${attr}='./${p1}`);
 }
 
+// ── Service worker modificato ─────────────────────────────────────
+let _patchedSw = null;
+
+function getPatchedSw(cb) {
+  if (_patchedSw) { cb(_patchedSw); return; }
+  http.get({ hostname: PI_WEB_UI_HOST, port: PI_WEB_UI_PORT, path: "/sw.js" }, (res) => {
+    let data = "";
+    res.on("data", (c) => { data += c; });
+    res.on("end", () => {
+      // Inserisce un bypass WebSocket all'inizio del fetch handler.
+      // Chrome/Edge abbattono le connessioni WS quando lo SW intercetta
+      // ma non chiama respondWith(). Con respondWith(fetch(...)) il WS
+      // viene correttamente inoltrato alla rete.
+      _patchedSw = data.replace(
+        'self.addEventListener("fetch", (event) => {',
+        `self.addEventListener("fetch", (event) => {
+  // Chrome/Edge abbattono le WS se lo SW intercetta senza respondWith
+  if (event.request.headers && event.request.headers.get("Upgrade") === "websocket") {
+    event.respondWith(fetch(event.request));
+    return;
+  }`);
+      cb(_patchedSw);
+    });
+  }).on("error", (err) => {
+    console.error(`[proxy] SW fetch failed: ${err.message}`);
+    cb(null);
+  });
+}
+
+// ── Server HTTP ──────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   const base = getIngressBase(req);
   const path = targetPath(req.url, base);
-  console.log(`[proxy] ${req.method} ${req.url} host="${req.headers.host || ""}" x-ingress="${req.headers["x-ingress-path"] || ""}" origin="${req.headers.origin || ""}"`);
+
+  // /sw.js → serve patch modificato (non la versione originale di pi-web-ui)
+  if (path === "/sw.js") {
+    getPatchedSw((swContent) => {
+      if (!swContent) { res.writeHead(502); res.end(); return; }
+      res.writeHead(200, {
+        "Content-Type": "application/javascript; charset=UTF-8",
+        "Content-Length": Buffer.byteLength(swContent),
+        "Cache-Control": "no-cache",
+      });
+      res.end(swContent);
+    });
+    return;
+  }
+
+  // Tutte le altre richieste → proxy a pi-web-ui
   const opts = {
     hostname: PI_WEB_UI_HOST,
     port: PI_WEB_UI_PORT,
@@ -56,33 +90,22 @@ const server = http.createServer((req, res) => {
     method: req.method,
     headers: {
       ...req.headers,
-      // IMPORTANTE: NON sovrascrivere `host` con 127.0.0.1:8888. pi-web-ui
-      // valida l'ammissione WebSocket confrontando l'Origin del browser con
-      // l'header Host ricevuto; sovrascrivendolo i due non coinciderebbero e
-      // il server rifiuterebbe l'upgrade con 403 (schermata nera).
-      // Chiediamo sempre identity: se l'upstream comprime (gzip) non potremmo
-      // riscrivere il body testuale in modo sicuro. Su LAN il costo è trascurabile.
       "accept-encoding": "identity",
       "x-forwarded-host": req.headers.host || "",
     },
   };
-  // Header del client/ingress che non devono arrivare all'upstream.
   delete opts.headers["x-ingress-path"];
 
   const proxyReq = http.request(opts, (proxyRes) => {
-    const ctype = (proxyRes.headers["content-type"] || "");
-    const isHtml = /^text\/html/i.test(ctype) && proxyRes.statusCode !== 204;
+    const ctype = (proxyRes.headers["content-type"] || "").toLowerCase();
+    const isHtml = ctype.startsWith("text/html") && proxyRes.statusCode !== 204;
 
-    // Tutto ciò che non è HTML (JS, CSS, JSON, immagini, WS) passa invariato:
-    // content-length e content-encoding restano validi.
     if (!isHtml) {
       res.writeHead(proxyRes.statusCode, proxyRes.headers);
       proxyRes.pipe(res);
       return;
     }
 
-    // Solo HTML: buffera, rendi relativi gli asset, ricalcola content-length
-    // (e togli gli header non più validi dopo la riscrittura).
     const chunks = [];
     let total = 0;
     proxyRes.on("data", (c) => { chunks.push(c); total += c.length; });
@@ -101,7 +124,6 @@ const server = http.createServer((req, res) => {
   });
 
   proxyReq.on("error", (err) => {
-    console.error(`[pi-web-addon proxy] ${err.message}`);
     if (!res.headersSent) res.writeHead(502);
     res.end();
   });
@@ -109,27 +131,19 @@ const server = http.createServer((req, res) => {
   req.pipe(proxyReq);
 });
 
-// WebSocket: handshake scritto a mano verso pi-web-ui (path stripped, key client
-// originale, nessun ricalcolo accept), poi tunnel puro dei byte in entrambe le direzioni.
+// ── WebSocket ────────────────────────────────────────────────────
 server.on("upgrade", (request, socket) => {
   const base = getIngressBase(request);
   const path = targetPath(request.url, base);
-  console.log(`[proxy] WS upgrade url="${request.url}" host="${request.headers.host || ""}" origin="${request.headers.origin || ""}" x-ingress="${request.headers["x-ingress-path"] || ""}"`);
   try {
     const up = net.connect({ hostname: PI_WEB_UI_HOST, port: PI_WEB_UI_PORT });
     up.on("ready", () => {
       const hdrs = [
         `GET ${path} HTTP/1.1`,
-        // Preserva l'Host originale del browser: pi-web-ui lo confronta con
-        // l'Origin per ammettere l'upgrade WebSocket (stessa autorità).
         `Host: ${request.headers.host || `${PI_WEB_UI_HOST}:${PI_WEB_UI_PORT}`}`,
         "Upgrade: websocket",
         "Connection: Upgrade",
         ...(
-          // NON inoltrare "Origin": pi-web-ui ammette i client senza Origin
-          // (regola "non-browser client"). L'Origin del browser dietro ingress
-          // a sessione non coincide con l'Host che il Supervisor usa lato WS,
-          // quindi inoltrandolo pi-web-ui risponderebbe 403.
           ["Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol", "Sec-WebSocket-Extensions", "User-Agent", "Cookie"]
             .filter((k) => request.headers[k.toLowerCase()])
             .map((k) => `${k}: ${request.headers[k.toLowerCase()]}`)
@@ -138,7 +152,6 @@ server.on("upgrade", (request, socket) => {
         "",
       ].join("\r\n");
       up.write(hdrs);
-      // splice bidirezionale: i byte del 101 e dei frame passano intatti
       up.pipe(socket);
       socket.pipe(up);
     });
