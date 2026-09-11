@@ -2,8 +2,14 @@
  * Pi Web Addon proxy — HTTP e WebSocket forward per ingress Home Assistant.
  * Ascolta su :3000 (ingress_port dell'add-on), inoltra a pi-web-ui su 127.0.0.1:8888.
  * Strippa il prefisso ingress (X-Ingress-Path) dal path in ingresso e riscrive
- * i riferimenti assoluti (src/href, /api/, /ws) nei body HTML/JS con quel prefisso.
- * Stesso pattern di /data/pi-web-proxy.mjs (già integrato nel server pi-web-ui).
+ * SOLO i riferimenti asset assoluti (src/href) nell'HTML con quel prefisso.
+ *
+ * IMPORTANTE (pi-web-ui v0.76.0): il frontend calcola già il base path a runtime
+ * da `document.baseURI` (funzioni Kl()/cr()/at() nel bundle) e lo applica a /ws,
+ * /api/* e alla registrazione del service worker. Riscrivere "/api/" e "/ws" nei
+ * body JS causerebbe un DOPPIO prefisso (es. .../pi_web_ui_agent/pi_web_ui_agent/api/...)
+ * e romperebbe API e WebSocket. Qui si riscrivono quindi solo i path asset assoluti
+ * dell'index.html (/assets/, /favicon.svg, ecc.), che il frontend NON riscrive da solo.
  */
 
 import http from "node:http";
@@ -12,8 +18,6 @@ import net from "node:net";
 const PI_WEB_UI_PORT = 8888;
 const PI_WEB_UI_HOST = "127.0.0.1";
 const LISTEN_PORT = Number(process.env.LISTEN_PORT || 3000);
-
-const TEXT_TYPES = /^text\/(html|css|javascript|x-javascript|plain)|^application\/(json|javascript|x-javascript)/;
 
 function getIngressBase(req) {
   const p = (req.headers["x-ingress-path"] || "").replace(/\/+$/, "");
@@ -27,17 +31,13 @@ function targetPath(url, base) {
   return p === "" ? "/" : p;
 }
 
-/** Riscrive i path assoluti della UI aggiungendo il prefisso ingress */
-function rewriteBody(bodyStr, ingressBase) {
+/** Riscrive i path asset assoluti dell'HTML aggiungendo il prefisso ingress */
+function rewriteHtml(bodyStr, ingressBase) {
   if (!ingressBase) return bodyStr;
   const base = ingressBase.replace(/^\//, ""); // senza slash iniziale
-  // Ordine importante: prima /api/ e /ws (altrimenti matchherebbero il prefisso appena inserito)
-  let s = bodyStr
-    .replace(/(["'`])\/api\//g, (m, q) => `${q}/${base}/api/`)
-    .replace(/(["'`])\/ws(["'`])/g, (m, q1, q2) => `${q1}/${base}/ws${q2}`);
-  return s
+  return bodyStr
     .replace(/="\/(assets\/|favicon\.svg|manifest\.webmanifest|icons\/)/g, (m, p1) => `="/${base}/${p1}`)
-    .replace(/'\/(assets\/|favicon\.svg)/g, (m, p1) => `'/${base}/${p1}`);
+    .replace(/='\/(assets\/|favicon\.svg)/g, (m, p1) => `='/${base}/${p1}`);
 }
 
 const server = http.createServer((req, res) => {
@@ -51,30 +51,43 @@ const server = http.createServer((req, res) => {
     headers: {
       ...req.headers,
       host: `${PI_WEB_UI_HOST}:${PI_WEB_UI_PORT}`,
-      "x-forwarded-prefix": base,
+      // Chiediamo sempre identity: se l'upstream comprime (gzip) non potremmo
+      // riscrivere il body testuale in modo sicuro. Su LAN il costo è trascurabile.
+      "accept-encoding": "identity",
       "x-forwarded-host": req.headers.host || "",
     },
   };
+  // Header del client/ingress che non devono arrivare all'upstream.
   delete opts.headers["x-ingress-path"];
-  delete opts.headers["x-forwarded-prefix"];
 
   const proxyReq = http.request(opts, (proxyRes) => {
     const ctype = (proxyRes.headers["content-type"] || "");
-    const isText = TEXT_TYPES.test(ctype) && proxyRes.statusCode !== 204;
-    if (!isText || !base) {
+    const isHtml = /^text\/html/i.test(ctype) && proxyRes.statusCode !== 204;
+
+    // Tutto ciò che non è HTML (JS, CSS, JSON, immagini, WS-adjacent) passa
+    // invariato: content-length e content-encoding restano validi.
+    if (!isHtml || !base) {
       res.writeHead(proxyRes.statusCode, proxyRes.headers);
       proxyRes.pipe(res);
       return;
     }
-    // Body testuale con prefisso ingress → raccogli, riscrivi, invia
+
+    // Solo HTML con prefisso ingress: buffera, riscrivi gli asset, ricalcola
+    // content-length (e togli gli header non più validi dopo la riscrittura).
     const chunks = [];
     let total = 0;
     proxyRes.on("data", (c) => { chunks.push(c); total += c.length; });
     proxyRes.on("end", () => {
-      res.writeHead(proxyRes.statusCode, proxyRes.headers);
       const body = Buffer.concat(chunks, total).toString("utf8");
-      res.write(rewriteBody(body, base));
-      res.end();
+      const rewritten = rewriteHtml(body, base);
+      const headers = { ...proxyRes.headers };
+      delete headers["content-length"];
+      delete headers["content-encoding"];
+      delete headers["etag"];
+      delete headers["accept-ranges"];
+      headers["content-length"] = Buffer.byteLength(rewritten);
+      res.writeHead(proxyRes.statusCode, headers);
+      res.end(rewritten);
     });
   });
 
@@ -91,12 +104,10 @@ const server = http.createServer((req, res) => {
 // originale, nessun ricalcolo accept), poi tunnel puro dei byte in entrambe le direzioni.
 server.on("upgrade", (request, socket) => {
   const base = getIngressBase(request);
-  console.log(`[pi-web-addon proxy] upgrade url="${request.url}" base="${base}" hkeys=${Object.keys(request.headers).join(",")}`);
   const path = targetPath(request.url, base);
   try {
-    const up = net.connect({ hostname: PI_WEB_UI_HOST, port: PI_WEB_UI_PORT, remoteAddress: "127.0.0.1" });
+    const up = net.connect({ hostname: PI_WEB_UI_HOST, port: PI_WEB_UI_PORT });
     up.on("ready", () => {
-      console.log(`[pi-web-addon proxy] WS ready, sending handshake to ${path}`);
       const hdrs = [
         `GET ${path} HTTP/1.1`,
         `Host: ${PI_WEB_UI_HOST}:${PI_WEB_UI_PORT}`,
